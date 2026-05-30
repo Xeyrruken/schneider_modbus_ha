@@ -1,0 +1,311 @@
+"""Config and options flow for the Schneider Conext / Insight Home integration."""
+
+from __future__ import annotations
+
+import uuid
+from typing import Any
+
+import voluptuous as vol
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlow,
+)
+from homeassistant.core import callback
+from homeassistant.helpers import config_validation as cv
+
+from .const import (
+    CONF_DEVICE_UID,
+    CONF_DEVICES,
+    CONF_FAST_KEYS,
+    CONF_HOST,
+    CONF_LIVE_INTERVAL,
+    CONF_PORT,
+    CONF_SCAN_CIDR,
+    CONF_SCAN_INTERVAL,
+    CONF_WORD_ORDER,
+    DEFAULT_LIVE_INTERVAL,
+    DEFAULT_PORT,
+    DEFAULT_SCAN_INTERVAL,
+    DEFAULT_WORD_ORDER,
+    DOMAIN,
+    SIGNATURE_ADDRESS,
+    SIGNATURE_INPUT_TYPE,
+    SIGNATURE_SLAVE,
+    WORD_ORDER_OPTIONS,
+)
+from .devices import DEVICE_TYPES, DEVICE_TYPES_BY_KEY, LEGACY_DEVICES, build_sensors
+from .discovery import detect_devices, scan_for_gateways
+from .modbus_api import ModbusError, SchneiderModbus
+
+# Friendly labels for the manual "add a device" type dropdown.
+_TYPE_LABELS = {d.key: d.name for d in DEVICE_TYPES}
+
+
+async def _resolve_uid(hass, host: str) -> str:
+    """Return a stable device id (MAC if resolvable, else a random uuid)."""
+    try:
+        from getmac import get_mac_address
+
+        mac = await hass.async_add_executor_job(lambda: get_mac_address(ip=host))
+        if mac:
+            return mac.lower().replace(":", "")
+    except Exception:  # noqa: BLE001 - getmac is best-effort
+        pass
+    return uuid.uuid4().hex
+
+
+async def _validate_host(host: str, port: int) -> bool:
+    client = SchneiderModbus(host, port)
+    try:
+        await client.connect()
+        await client.read_registers(
+            SIGNATURE_SLAVE, SIGNATURE_INPUT_TYPE, SIGNATURE_ADDRESS, 1
+        )
+        return True
+    except (ModbusError, OSError):
+        return False
+    finally:
+        await client.close()
+
+
+def _candidate_label(cand: dict) -> str:
+    """Human label for a detected device in the selection list."""
+    dtype = DEVICE_TYPES_BY_KEY.get(cand["type"])
+    base = (cand.get("name") or "").strip() or (dtype.name if dtype else cand["type"])
+    return f"{base} — slave {cand['slave']}"
+
+
+class SchneiderConfigFlow(ConfigFlow, domain=DOMAIN):
+    """Handle the UI config flow."""
+
+    VERSION = 1
+
+    def __init__(self) -> None:
+        self._host: str = ""
+        self._port: int = DEFAULT_PORT
+        self._uid: str = ""
+        self._candidates: list[dict] = []
+        self._chosen: list[dict] = []
+        self._added: list[dict] = []
+        self._reconfigure_entry: ConfigEntry | None = None
+
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        return self.async_show_menu(step_id="user", menu_options=["scan", "manual"])
+
+    async def async_step_scan(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Scan the local subnet for a gateway."""
+        if user_input is not None:
+            self._port = user_input[CONF_PORT]
+            cidr = user_input.get(CONF_SCAN_CIDR) or None
+            found = await scan_for_gateways(self.hass, self._port, cidr)
+            if not found:
+                return self.async_show_form(
+                    step_id="scan",
+                    data_schema=self._scan_schema(),
+                    errors={"base": "no_devices_found"},
+                )
+            return await self._set_host(found[0], self._port)
+
+        return self.async_show_form(step_id="scan", data_schema=self._scan_schema())
+
+    async def async_step_manual(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Enter the gateway host manually."""
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            host = user_input[CONF_HOST]
+            port = user_input[CONF_PORT]
+            if await _validate_host(host, port):
+                return await self._set_host(host, port)
+            errors["base"] = "cannot_connect"
+
+        return self.async_show_form(
+            step_id="manual",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_HOST): str,
+                    vol.Required(CONF_PORT, default=DEFAULT_PORT): int,
+                }
+            ),
+            errors=errors,
+        )
+
+    async def _set_host(self, host: str, port: int) -> ConfigFlowResult:
+        """Record the gateway, set the unique id, then detect devices."""
+        self._host = host
+        self._port = port
+        self._uid = await _resolve_uid(self.hass, host)
+        await self.async_set_unique_id(self._uid)
+        self._abort_if_unique_id_configured(updates={CONF_HOST: host})
+        self._candidates = await detect_devices(host, port)
+        return await self.async_step_select()
+
+    async def async_step_select(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Let the user pick which detected devices to create."""
+        if user_input is not None:
+            self._chosen = [
+                self._candidates[int(i)] for i in user_input["devices"]
+            ]
+            if user_input.get("add_device"):
+                return await self.async_step_add()
+            return await self._finalize()
+
+        options = {
+            str(i): _candidate_label(cand)
+            for i, cand in enumerate(self._candidates)
+        }
+        schema = vol.Schema(
+            {
+                vol.Required("devices", default=list(options)): cv.multi_select(
+                    options
+                ),
+                vol.Required("add_device", default=False): bool,
+            }
+        )
+        return self.async_show_form(
+            step_id="select",
+            data_schema=schema,
+            description_placeholders={"count": str(len(self._candidates))},
+        )
+
+    async def async_step_add(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Manually add a device that wasn't detected (loops if requested)."""
+        if user_input is not None:
+            self._added.append(
+                {
+                    "type": user_input["type"],
+                    "slave": int(user_input["slave"]),
+                    "custom_name": user_input.get("name", ""),
+                }
+            )
+            if user_input.get("add_another"):
+                return await self.async_step_add()
+            return await self._finalize()
+
+        schema = vol.Schema(
+            {
+                vol.Required("type"): vol.In(_TYPE_LABELS),
+                vol.Required("slave"): vol.All(int, vol.Range(min=1, max=247)),
+                vol.Optional("name"): str,
+                vol.Required("add_another", default=False): bool,
+            }
+        )
+        return self.async_show_form(step_id="add", data_schema=schema)
+
+    async def _finalize(self) -> ConfigFlowResult:
+        """Persist the chosen + manually added devices."""
+        devices = self._chosen + self._added
+        if self._reconfigure_entry is not None:
+            return self.async_update_reload_and_abort(
+                self._reconfigure_entry,
+                data={**self._reconfigure_entry.data, CONF_DEVICES: devices},
+            )
+        return self.async_create_entry(
+            title=f"Conext Gateway ({self._host})",
+            data={
+                CONF_HOST: self._host,
+                CONF_PORT: self._port,
+                CONF_DEVICE_UID: self._uid,
+                CONF_DEVICES: devices,
+            },
+        )
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Re-scan an existing entry and re-select devices."""
+        entry = self._get_reconfigure_entry()
+        self._reconfigure_entry = entry
+        self._host = entry.data[CONF_HOST]
+        self._port = entry.data[CONF_PORT]
+        self._candidates = await detect_devices(self._host, self._port)
+        return await self.async_step_select()
+
+    @staticmethod
+    def _scan_schema() -> vol.Schema:
+        return vol.Schema(
+            {
+                vol.Required(CONF_PORT, default=DEFAULT_PORT): int,
+                vol.Optional(CONF_SCAN_CIDR): str,
+            }
+        )
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(entry: ConfigEntry) -> OptionsFlow:
+        return SchneiderOptionsFlow()
+
+
+class SchneiderOptionsFlow(OptionsFlow):
+    """Handle integration options."""
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        if user_input is not None:
+            return self.async_create_entry(title="", data=user_input)
+
+        opts = self.config_entry.options
+
+        # Build the candidate list for the live-sensor picker.
+        # Only numeric, current-value sensors are useful to poll fast:
+        # skip enum/status sensors (value_map set) and energy counters
+        # (total_increasing) — those don't need sub-second refresh.
+        all_sensors = build_sensors(
+            self.config_entry.data.get(CONF_DEVICES, LEGACY_DEVICES)
+        )
+        live_candidates = {
+            s.key: f"{s.device_label} — {s.name}"
+            for s in all_sensors
+            if s.value_map is None
+            and s.state_class == "measurement"
+            and s.unit is not None
+        }
+
+        # Default selection: stored user choice, or the template fast=True set.
+        stored_fast: list[str] | None = opts.get(CONF_FAST_KEYS)
+        if stored_fast is not None:
+            default_fast = [k for k in stored_fast if k in live_candidates]
+        else:
+            default_fast = [k for k in live_candidates if any(
+                s.key == k and s.fast for s in all_sensors
+            )]
+
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_SCAN_INTERVAL,
+                        default=opts.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL),
+                    ): vol.All(int, vol.Range(min=5, max=3600)),
+                    vol.Required(
+                        CONF_LIVE_INTERVAL,
+                        default=opts.get(CONF_LIVE_INTERVAL, DEFAULT_LIVE_INTERVAL),
+                    ): vol.All(int, vol.Range(min=1, max=60)),
+                    vol.Required(
+                        CONF_FAST_KEYS,
+                        default=default_fast,
+                    ): cv.multi_select(live_candidates),
+                    vol.Required(
+                        CONF_WORD_ORDER,
+                        default=opts.get(CONF_WORD_ORDER, DEFAULT_WORD_ORDER),
+                    ): vol.In(WORD_ORDER_OPTIONS),
+                    vol.Optional(
+                        CONF_SCAN_CIDR,
+                        default=opts.get(CONF_SCAN_CIDR, ""),
+                    ): str,
+                }
+            ),
+        )

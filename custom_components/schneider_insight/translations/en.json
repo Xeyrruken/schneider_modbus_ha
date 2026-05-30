@@ -1,0 +1,69 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Schneider Conext / Insight Home",
+        "description": "Find your gateway automatically or enter its address manually.",
+        "menu_options": {
+          "scan": "Scan my network for the gateway",
+          "manual": "Enter the gateway IP manually"
+        }
+      },
+      "scan": {
+        "title": "Scan for gateway",
+        "description": "Probe the local network for a Conext gateway on the given Modbus port. Leave the CIDR blank to scan all local subnets.",
+        "data": {
+          "port": "Modbus TCP port",
+          "scan_cidr": "Subnet to scan (optional, e.g. 192.168.50.0/24)"
+        }
+      },
+      "manual": {
+        "title": "Gateway connection",
+        "data": {
+          "host": "Gateway IP address",
+          "port": "Modbus TCP port"
+        }
+      },
+      "select": {
+        "title": "Select devices",
+        "description": "Found {count} device(s) on your Conext system. Check the ones you want to use — entities are created only for selected devices. Tick \"Add a device\" if something is missing.",
+        "data": {
+          "devices": "Devices to use",
+          "add_device": "Add a device that wasn't found"
+        }
+      },
+      "add": {
+        "title": "Add a device",
+        "description": "Manually add a device. Pick its type, the Modbus slave ID it uses, and an optional custom name.",
+        "data": {
+          "type": "Device type",
+          "slave": "Modbus slave ID",
+          "name": "Custom name (optional)",
+          "add_another": "Add another device after this one"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not reach a Conext gateway at that address/port.",
+      "no_devices_found": "No Conext gateway responded on the scanned network."
+    },
+    "abort": {
+      "already_configured": "This gateway is already configured.",
+      "reconfigure_successful": "Devices re-scanned and updated."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Schneider Insight options",
+        "data": {
+          "scan_interval": "Main polling interval (seconds)",
+          "live_scan_interval": "Live polling interval (seconds, for real-time power values)",
+          "fast_keys": "Sensors to include in the live (fast) polling group",
+          "word_order": "32-bit word order (use 'little' if 32-bit values look wrong)",
+          "scan_cidr": "Rediscovery subnet (optional, e.g. 192.168.50.0/24)"
+        }
+      }
+    }
+  }
+}
