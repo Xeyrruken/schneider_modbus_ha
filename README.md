@@ -41,7 +41,7 @@ UI-configured entities.
    *Integration*.
 2. Install **Schneider Conext / Insight Home**, then restart Home Assistant.
 
-Or copy `custom_components/schneider_insight/` into your HA `config/custom_components/`
+Or copy `custom_components/schneider_modbus_ha/` into your HA `config/custom_components/`
 and restart.
 
 ## Set up

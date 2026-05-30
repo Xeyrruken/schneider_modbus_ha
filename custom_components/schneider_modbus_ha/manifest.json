@@ -1,0 +1,12 @@
+{
+  "domain": "schneider_modbus_ha",
+  "name": "Schneider Conext / Insight Home",
+  "version": "0.0.1",
+  "codeowners": ["@Xeyrruken"],
+  "config_flow": true,
+  "documentation": "https://github.com/Xeyrruken/schneider_modbus_ha",
+  "issue_tracker": "https://github.com/Xeyrruken/schneider_modbus_ha/issues",
+  "iot_class": "local_polling",
+  "integration_type": "hub",
+  "requirements": ["pymodbus>=3.6.0", "getmac>=0.9.0"]
+}
