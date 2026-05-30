@@ -1,0 +1,12 @@
+{
+  "domain": "schneider_insight",
+  "name": "Schneider Conext / Insight Home",
+  "version": "0.4.0",
+  "codeowners": [],
+  "config_flow": true,
+  "documentation": "https://github.com/yourname/ha-schneider-insight",
+  "issue_tracker": "https://github.com/yourname/ha-schneider-insight/issues",
+  "iot_class": "local_polling",
+  "integration_type": "hub",
+  "requirements": ["pymodbus>=3.6.0", "getmac>=0.9.0"]
+}
