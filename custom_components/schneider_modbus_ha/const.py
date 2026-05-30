@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-DOMAIN = "schneider_insight"
+DOMAIN = "schneider_modbus_ha"
 
 # Config / options keys
 CONF_HOST = "host"
