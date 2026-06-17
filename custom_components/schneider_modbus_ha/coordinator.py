@@ -224,21 +224,28 @@ class SchneiderCoordinator(DataUpdateCoordinator[dict[str, object]]):
     ) -> None:
         self._conn = connection
         self.sensors = sensors
-        self._blocks = _plan_blocks(sensors)
         super().__init__(
             hass, _LOGGER, name=name, update_interval=timedelta(seconds=interval)
         )
 
     async def _async_update_data(self) -> dict[str, object]:
-        cache = await self._conn.read_blocks(self._blocks)
-        return self._decode_all(cache)
+        # Only poll registers whose entity is actually enabled/added. HA does
+        # not add disabled entities, so their register never reaches a context
+        # and costs no Modbus traffic.
+        active: list[RegSensor] = list(self.async_contexts())
+        if not active:
+            return {}
+        cache = await self._conn.read_blocks(_plan_blocks(active))
+        return self._decode(active, cache)
 
-    def _decode_all(
-        self, cache: dict[tuple[int, str], dict[int, int]]
+    def _decode(
+        self,
+        sensors: list[RegSensor],
+        cache: dict[tuple[int, str], dict[int, int]],
     ) -> dict[str, object]:
         word_order = self._conn.word_order
         data: dict[str, object] = {}
-        for reg in self.sensors:
+        for reg in sensors:
             reg_map = cache.get((reg.slave, reg.input_type), {})
             words = [reg_map.get(reg.address + i) for i in range(reg.count)]
             if any(w is None for w in words):
