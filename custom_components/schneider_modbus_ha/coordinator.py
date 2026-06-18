@@ -35,21 +35,30 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class _Block:
-    """A contiguous run of registers read together.
+    """A planned read for one (slave, input_type).
 
-    ``subblocks`` is discovered lazily: ``None`` means "try the whole block";
-    once the gateway rejects it (unmapped register hole) we binary-split the
-    range into the readable sub-ranges and cache them here.
+    ``whole`` is the optimistic single read spanning ``start``..``end`` (small
+    gaps bridged). ``runs`` are the fallback reads: each is a *contiguous run of
+    real sensor registers* — whole values back-to-back with no gap. Reading by
+    runs never bridges an unmapped hole and never cuts a 32-bit register pair,
+    both of which the Conext gateway rejects.
     """
 
-    __slots__ = ("slave", "input_type", "start", "end", "subblocks")
+    __slots__ = ("slave", "input_type", "start", "end", "runs")
 
-    def __init__(self, slave: int, input_type: str, start: int, end: int) -> None:
+    def __init__(
+        self,
+        slave: int,
+        input_type: str,
+        start: int,
+        end: int,
+        runs: list[tuple[int, int]],
+    ) -> None:
         self.slave = slave
         self.input_type = input_type
         self.start = start
         self.end = end  # exclusive
-        self.subblocks: list[tuple[int, int]] | None = None
+        self.runs = runs  # list of (start, count), gap-free and pair-aligned
 
     @property
     def count(self) -> int:
@@ -57,7 +66,11 @@ class _Block:
 
 
 def _plan_blocks(sensors: list[RegSensor]) -> list[_Block]:
-    """Group sensor registers into block reads per (slave, input_type)."""
+    """Group sensor registers into block reads per (slave, input_type).
+
+    Each block carries both the bridged span (for one optimistic read) and the
+    gap-free contiguous runs (the safe fallback).
+    """
     groups: dict[tuple[int, str], list[RegSensor]] = {}
     for reg in sensors:
         groups.setdefault((reg.slave, reg.input_type), []).append(reg)
@@ -65,18 +78,26 @@ def _plan_blocks(sensors: list[RegSensor]) -> list[_Block]:
     blocks: list[_Block] = []
     for (slave, input_type), regs in groups.items():
         regs.sort(key=lambda r: r.address)
-        cur_start = regs[0].address
+        cur_start = cur_end = regs[0].address + 0
         cur_end = regs[0].address + regs[0].count
+        run_start = regs[0].address
+        runs: list[tuple[int, int]] = []
         for reg in regs[1:]:
             r_end = reg.address + reg.count
-            if (reg.address - cur_end) <= MAX_BLOCK_GAP and (
-                r_end - cur_start
-            ) <= MAX_BLOCK_REGISTERS:
-                cur_end = max(cur_end, r_end)
-            else:
-                blocks.append(_Block(slave, input_type, cur_start, cur_end))
-                cur_start, cur_end = reg.address, r_end
-        blocks.append(_Block(slave, input_type, cur_start, cur_end))
+            gap = reg.address - cur_end
+            if gap <= MAX_BLOCK_GAP and (r_end - cur_start) <= MAX_BLOCK_REGISTERS:
+                if gap > 0:  # mapped-but-unread or unmapped hole: split the run
+                    runs.append((run_start, cur_end - run_start))
+                    run_start = reg.address
+                cur_end = r_end
+            else:  # gap too big (or block too long): close this block
+                runs.append((run_start, cur_end - run_start))
+                blocks.append(_Block(slave, input_type, cur_start, cur_end, runs))
+                cur_start = run_start = reg.address
+                cur_end = r_end
+                runs = []
+        runs.append((run_start, cur_end - run_start))
+        blocks.append(_Block(slave, input_type, cur_start, cur_end, runs))
     return blocks
 
 
@@ -93,6 +114,9 @@ class SchneiderConnection:
         self._client = SchneiderModbus(self._host, self._port)
         self._lock = asyncio.Lock()
         self._rediscovering = False
+        # Block identities (slave, itype, start, end) known to need the run-by-run
+        # fallback, so we skip the doomed optimistic whole-block read next time.
+        self._needs_runs: set[tuple[int, str, int, int]] = set()
 
     async def close(self) -> None:
         await self._client.close()
@@ -112,6 +136,14 @@ class SchneiderConnection:
                 return await self._read_all(blocks)
             except (ModbusError, OSError) as err:
                 await self._client.close()
+                # Cheap path first: a transient blip usually just needs a fresh
+                # socket to the same host. Only sweep the subnet if that fails
+                # (i.e. the gateway's IP actually changed).
+                try:
+                    await self._client.connect()
+                    return await self._read_all(blocks)
+                except (ModbusError, OSError):
+                    await self._client.close()
                 if await self._try_rediscover():
                     try:
                         return await self._read_all(blocks)
@@ -129,27 +161,33 @@ class SchneiderConnection:
         return cache
 
     async def _read_block(self, block: _Block, reg_map: dict[int, int]) -> None:
-        if block.subblocks is None:
+        key = (block.slave, block.input_type, block.start, block.end)
+
+        # Optimistic single read of the whole bridged span — but only if it
+        # isn't already known to need the fallback, and only worth trying when
+        # the span is a single gap-free run.
+        if key not in self._needs_runs and len(block.runs) == 1:
             try:
                 words = await self._client.read_registers(
                     block.slave, block.input_type, block.start, block.count
                 )
-                block.subblocks = [(block.start, block.count)]
                 for i, word in enumerate(words):
                     reg_map[block.start + i] = word
                 return
             except ModbusDeviceException:
+                self._needs_runs.add(key)
                 _LOGGER.info(
-                    "Gateway rejected block (slave %d, %s %d+%d); binary-splitting "
-                    "into readable sub-blocks",
+                    "Gateway rejected block (slave %d, %s %d+%d); reading by "
+                    "contiguous runs instead",
                     block.slave, block.input_type, block.start, block.count,
                 )
-                block.subblocks = await self._probe_range(
-                    block.slave, block.input_type, block.start, block.count
-                )
             # ModbusError (transport) propagates for rediscovery handling.
+        elif key not in self._needs_runs and len(block.runs) > 1:
+            self._needs_runs.add(key)  # has gaps; skip straight to runs
 
-        for start, count in block.subblocks:
+        # Fallback: read each gap-free, pair-aligned run. Skip a run only if the
+        # device genuinely rejects it (register absent on this hardware).
+        for start, count in block.runs:
             try:
                 words = await self._client.read_registers(
                     block.slave, block.input_type, start, count
@@ -157,26 +195,7 @@ class SchneiderConnection:
                 for i, word in enumerate(words):
                     reg_map[start + i] = word
             except ModbusDeviceException:
-                continue  # genuinely unmapped on this hardware
-
-    async def _probe_range(
-        self, slave: int, input_type: str, start: int, count: int
-    ) -> list[tuple[int, int]]:
-        """Binary-split a rejected range into the sub-ranges the device accepts."""
-        if count <= 0:
-            return []
-        try:
-            await self._client.read_registers(slave, input_type, start, count)
-            return [(start, count)]
-        except ModbusDeviceException:
-            if count == 1:
-                return []  # single register unreadable -> drop it
-            mid = count // 2
-            left = await self._probe_range(slave, input_type, start, mid)
-            right = await self._probe_range(
-                slave, input_type, start + mid, count - mid
-            )
-            return left + right
+                continue
 
     async def _try_rediscover(self) -> bool:
         """Scan the subnet for the gateway and switch to its current IP."""
@@ -225,7 +244,13 @@ class SchneiderCoordinator(DataUpdateCoordinator[dict[str, object]]):
         self._conn = connection
         self.sensors = sensors
         super().__init__(
-            hass, _LOGGER, name=name, update_interval=timedelta(seconds=interval)
+            hass,
+            _LOGGER,
+            name=name,
+            update_interval=timedelta(seconds=interval),
+            # Data is a plain dict (value-comparable), so skip entity callbacks
+            # and state writes when a poll returns the same values as before.
+            always_update=False,
         )
 
     async def _async_update_data(self) -> dict[str, object]:
