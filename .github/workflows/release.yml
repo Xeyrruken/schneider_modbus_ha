@@ -1,0 +1,46 @@
+name: Release
+
+# Fires when you publish a GitHub Release. The release's tag is the single
+# source of truth for the version: it is written into manifest.json and the
+# integration is zipped and attached to the release for HACS to install.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+env:
+  INTEGRATION_DIR: custom_components/schneider_modbus_ha
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Derive version from tag
+        id: version
+        run: |
+          tag="${{ github.event.release.tag_name }}"
+          version="${tag#v}"          # strip an optional leading "v"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Releasing version: $version"
+
+      - name: Stamp version into manifest.json
+        run: |
+          jq --arg v "${{ steps.version.outputs.version }}" \
+            '.version=$v' "$INTEGRATION_DIR/manifest.json" > manifest.tmp
+          mv manifest.tmp "$INTEGRATION_DIR/manifest.json"
+          cat "$INTEGRATION_DIR/manifest.json"
+
+      - name: Zip the integration
+        run: |
+          cd "$INTEGRATION_DIR"
+          zip -r "${{ github.workspace }}/schneider_modbus_ha.zip" . -x '*__pycache__*'
+
+      - name: Attach zip to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: schneider_modbus_ha.zip
