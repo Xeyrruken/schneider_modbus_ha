@@ -1,7 +1,5 @@
 {
   "name": "Schneider Conext / Insight Home",
   "render_readme": true,
-  "homeassistant": "2024.12.0",
-  "zip_release": true,
-  "filename": "schneider_modbus_ha.zip"
+  "homeassistant": "2024.12.0"
 }

@@ -1,46 +1,28 @@
-name: Release
+name: Release check
 
-# Fires when you publish a GitHub Release. The release's tag is the single
-# source of truth for the version: it is written into manifest.json and the
-# integration is zipped and attached to the release for HACS to install.
+# Fires when you publish a GitHub Release. HACS installs the repository content
+# at the tag, so manifest.json's version IS the installed version. This guard
+# fails the release if the manifest version doesn't match the tag, preventing a
+# drift between what HACS offers and what HA shows.
 on:
   release:
-    types: [published]
-
-permissions:
-  contents: write
-
-env:
-  INTEGRATION_DIR: custom_components/schneider_modbus_ha
+    types: [published, edited]
 
 jobs:
-  release:
+  verify-version:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Derive version from tag
-        id: version
+      - name: Manifest version must match the release tag
         run: |
           tag="${{ github.event.release.tag_name }}"
-          version="${tag#v}"          # strip an optional leading "v"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "Releasing version: $version"
-
-      - name: Stamp version into manifest.json
-        run: |
-          jq --arg v "${{ steps.version.outputs.version }}" \
-            '.version=$v' "$INTEGRATION_DIR/manifest.json" > manifest.tmp
-          mv manifest.tmp "$INTEGRATION_DIR/manifest.json"
-          cat "$INTEGRATION_DIR/manifest.json"
-
-      - name: Zip the integration
-        run: |
-          cd "$INTEGRATION_DIR"
-          zip -r "${{ github.workspace }}/schneider_modbus_ha.zip" . -x '*__pycache__*'
-
-      - name: Attach zip to the release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: schneider_modbus_ha.zip
+          want="${tag#v}"   # strip an optional leading "v"
+          have="$(jq -r .version custom_components/schneider_modbus_ha/manifest.json)"
+          echo "release tag -> $want"
+          echo "manifest    -> $have"
+          if [ "$want" != "$have" ]; then
+            echo "::error::manifest.json version ($have) does not match the release tag ($want). Bump the manifest and re-tag."
+            exit 1
+          fi
+          echo "Versions match."
