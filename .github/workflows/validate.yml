@@ -1,10 +1,11 @@
 name: Validate
 
+# Lightweight quality gate: confirms the integration's manifest is valid and it
+# will load in Home Assistant. (Not HACS-store validation — this repo is not
+# published to the HACS default store.)
 on:
   push:
   pull_request:
-  schedule:
-    - cron: "0 6 * * 1"   # weekly, catches HA/HACS rule changes
   workflow_dispatch:
 
 jobs:
@@ -14,15 +15,3 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: home-assistant/actions/hassfest@master
-
-  hacs:
-    name: HACS validation
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: hacs/action@main
-        with:
-          category: integration
-          # This is a custom repository, not a default HACS entry, so skip the
-          # brands check (brands registration is only needed for default HACS).
-          ignore: brands
