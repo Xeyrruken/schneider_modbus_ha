@@ -52,7 +52,9 @@ class SchneiderSensor(CoordinatorEntity[SchneiderCoordinator], SensorEntity):
         reg: RegSensor,
         device_uid: str,
     ) -> None:
-        super().__init__(coordinator)
+        # Pass the register as the coordinator context so the coordinator only
+        # polls registers whose entity is actually enabled/added.
+        super().__init__(coordinator, context=reg)
         self._reg = reg
         self._attr_unique_id = f"{device_uid}_{reg.key}"
         self._attr_name = reg.name
@@ -82,6 +84,11 @@ class SchneiderSensor(CoordinatorEntity[SchneiderCoordinator], SensorEntity):
         if reg.device_instance != GATEWAY_INSTANCE:
             device_info["via_device"] = (DOMAIN, f"{device_uid}_{GATEWAY_INSTANCE}")
         self._attr_device_info = device_info
+
+    async def async_added_to_hass(self) -> None:
+        """Once added (i.e. enabled), ask the coordinator to poll our register."""
+        await super().async_added_to_hass()
+        await self.coordinator.async_request_refresh()
 
     @property
     def native_value(self) -> object | None:

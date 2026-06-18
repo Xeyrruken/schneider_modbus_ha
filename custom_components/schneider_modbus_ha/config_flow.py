@@ -14,6 +14,14 @@ from homeassistant.config_entries import (
 )
 from homeassistant.core import callback
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.selector import (
+    NumberSelector,
+    NumberSelectorConfig,
+    NumberSelectorMode,
+    SelectSelector,
+    SelectSelectorConfig,
+    SelectSelectorMode,
+)
 
 from .const import (
     CONF_DEVICE_UID,
@@ -259,28 +267,35 @@ class SchneiderOptionsFlow(OptionsFlow):
         opts = self.config_entry.options
 
         # Build the candidate list for the live-sensor picker.
-        # Only numeric, current-value sensors are useful to poll fast:
-        # skip enum/status sensors (value_map set) and energy counters
-        # (total_increasing) — those don't need sub-second refresh.
+        # All sensors are eligible except energy counters (total_increasing),
+        # which only accumulate slowly and gain nothing from fast polling.
         all_sensors = build_sensors(
             self.config_entry.data.get(CONF_DEVICES, LEGACY_DEVICES)
         )
-        live_candidates = {
-            s.key: f"{s.device_label} — {s.name}"
-            for s in all_sensors
-            if s.value_map is None
-            and s.state_class == "measurement"
-            and s.unit is not None
-        }
+
+        # Sort by device-type order then sensor name so the dropdown is
+        # grouped naturally (Gateway → XW → MPPT → SCP → …).
+        _type_order = {d.key: i for i, d in enumerate(DEVICE_TYPES)}
+        candidates = sorted(
+            (s for s in all_sensors if s.state_class != "total_increasing"),
+            key=lambda s: (
+                _type_order.get(s.device_instance.split("_")[0], 99),
+                s.device_label,
+                s.name,
+            ),
+        )
+        live_options = [
+            {"value": s.key, "label": f"{s.device_label} — {s.name}"}
+            for s in candidates
+        ]
+        live_keys = {o["value"] for o in live_options}
 
         # Default selection: stored user choice, or the template fast=True set.
         stored_fast: list[str] | None = opts.get(CONF_FAST_KEYS)
         if stored_fast is not None:
-            default_fast = [k for k in stored_fast if k in live_candidates]
+            default_fast = [k for k in stored_fast if k in live_keys]
         else:
-            default_fast = [k for k in live_candidates if any(
-                s.key == k and s.fast for s in all_sensors
-            )]
+            default_fast = [s.key for s in candidates if s.fast]
 
         return self.async_show_form(
             step_id="init",
@@ -289,15 +304,25 @@ class SchneiderOptionsFlow(OptionsFlow):
                     vol.Required(
                         CONF_SCAN_INTERVAL,
                         default=opts.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL),
-                    ): vol.All(int, vol.Range(min=5, max=3600)),
+                    ): NumberSelector(NumberSelectorConfig(
+                        min=5, max=60, step=1, mode=NumberSelectorMode.BOX,
+                        unit_of_measurement="s",
+                    )),
                     vol.Required(
                         CONF_LIVE_INTERVAL,
                         default=opts.get(CONF_LIVE_INTERVAL, DEFAULT_LIVE_INTERVAL),
-                    ): vol.All(int, vol.Range(min=1, max=60)),
+                    ): NumberSelector(NumberSelectorConfig(
+                        min=1, max=60, step=1, mode=NumberSelectorMode.BOX,
+                        unit_of_measurement="s",
+                    )),
                     vol.Required(
                         CONF_FAST_KEYS,
                         default=default_fast,
-                    ): cv.multi_select(live_candidates),
+                    ): SelectSelector(SelectSelectorConfig(
+                        options=live_options,
+                        multiple=True,
+                        mode=SelectSelectorMode.DROPDOWN,
+                    )),
                     vol.Required(
                         CONF_WORD_ORDER,
                         default=opts.get(CONF_WORD_ORDER, DEFAULT_WORD_ORDER),
