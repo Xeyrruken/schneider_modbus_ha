@@ -1,15 +1,25 @@
-name: Release check
+name: Release
 
-# Fires when you publish a GitHub Release. HACS installs the repository content
-# at the tag, so manifest.json's version IS the installed version. This guard
-# fails the release if the manifest version doesn't match the tag, preventing a
-# drift between what HACS offers and what HA shows.
+# On a published GitHub Release:
+#   1. Verify manifest.json's version matches the tag (no version drift).
+#   2. Zip ONLY the integration folder (custom_components/schneider_modbus_ha)
+#      and attach it to the release as a clean, ready-to-install asset.
+#
+# GitHub always adds its own "Source code (zip/tar.gz)" links (whole repo) and
+# those can't be removed — but the attached schneider_modbus_ha.zip is the clean
+# one: unzip it straight into config/custom_components/.
 on:
   release:
-    types: [published, edited]
+    types: [published]
+
+permissions:
+  contents: write
+
+env:
+  INTEGRATION: schneider_modbus_ha
 
 jobs:
-  verify-version:
+  release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,11 +28,23 @@ jobs:
         run: |
           tag="${{ github.event.release.tag_name }}"
           want="${tag#v}"   # strip an optional leading "v"
-          have="$(jq -r .version custom_components/schneider_modbus_ha/manifest.json)"
+          have="$(jq -r .version "custom_components/$INTEGRATION/manifest.json")"
           echo "release tag -> $want"
           echo "manifest    -> $have"
           if [ "$want" != "$have" ]; then
             echo "::error::manifest.json version ($have) does not match the release tag ($want). Bump the manifest and re-tag."
             exit 1
           fi
-          echo "Versions match."
+
+      - name: Zip the integration folder only
+        run: |
+          cd custom_components
+          zip -r "../$INTEGRATION.zip" "$INTEGRATION" \
+            -x '*__pycache__*' -x '*.pyc'
+          echo "Contents:"
+          unzip -l "../$INTEGRATION.zip"
+
+      - name: Attach the zip to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.INTEGRATION }}.zip
