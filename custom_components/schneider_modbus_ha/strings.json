@@ -57,11 +57,18 @@
       "init": {
         "title": "Schneider Insight options",
         "data": {
-          "scan_interval": "Main polling interval (seconds)",
-          "live_scan_interval": "Live polling interval (seconds, for real-time power values)",
-          "fast_keys": "Sensors to include in the live (fast) polling group",
-          "word_order": "32-bit word order (use 'little' if 32-bit values look wrong)",
-          "scan_cidr": "Rediscovery subnet (optional, e.g. 192.168.50.0/24)"
+          "scan_interval": "Main polling interval",
+          "live_scan_interval": "Live polling interval",
+          "fast_keys": "Live sensors",
+          "word_order": "32-bit word order",
+          "scan_cidr": "Rediscovery subnet"
+        },
+        "data_description": {
+          "scan_interval": "How often all other sensors are refreshed (5 – 60 s).",
+          "live_scan_interval": "How often the live sensor group is read (1 – 60 s). Keep this as high as possible — polling too fast can overload the gateway.",
+          "fast_keys": "These sensors are polled at the live interval above. Selecting too many will slow down every poll and may cause gateway timeouts.",
+          "word_order": "Controls how 32-bit register pairs are combined. Use 'little' only if power or voltage readings look wrong.",
+          "scan_cidr": "Subnet to scan when the gateway IP changes (e.g. 192.168.50.0/24). Leave blank to scan all local subnets."
         }
       }
     }
