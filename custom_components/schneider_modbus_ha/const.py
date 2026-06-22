@@ -49,3 +49,10 @@ MAX_BLOCK_GAP = 16
 # Subnet scan tuning
 SCAN_CONCURRENCY = 64
 SCAN_CONNECT_TIMEOUT = 0.6  # seconds per host TCP probe
+
+# Reconnection backoff. While the gateway is unreachable we keep cheaply retrying
+# the SAME host every poll (a static/reserved IP returns at the same address), but
+# the expensive subnet rescan (for the rare case the IP changed) is rate-limited:
+# first after MIN seconds, then doubling up to MAX.
+SCAN_BACKOFF_MIN = 15   # seconds before the first rescan after a loss
+SCAN_BACKOFF_MAX = 120  # cap between rescans during a sustained outage
