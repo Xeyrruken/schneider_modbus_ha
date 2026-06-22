@@ -26,6 +26,8 @@ from .const import (
     DOMAIN,
     MAX_BLOCK_GAP,
     MAX_BLOCK_REGISTERS,
+    SCAN_BACKOFF_MAX,
+    SCAN_BACKOFF_MIN,
 )
 from .devices import RegSensor
 from .discovery import scan_for_gateways
@@ -117,6 +119,11 @@ class SchneiderConnection:
         # Block identities (slave, itype, start, end) known to need the run-by-run
         # fallback, so we skip the doomed optimistic whole-block read next time.
         self._needs_runs: set[tuple[int, str, int, int]] = set()
+        # Reconnection state. ``_down`` gates one-shot loss/restore logging;
+        # ``_last_scan`` + ``_scan_backoff`` rate-limit the subnet rescan.
+        self._down = False
+        self._last_scan = 0.0
+        self._scan_backoff = float(SCAN_BACKOFF_MIN)
 
     async def close(self) -> None:
         await self._client.close()
@@ -126,30 +133,56 @@ class SchneiderConnection:
     ) -> dict[tuple[int, str], dict[int, int]]:
         """Read the given blocks, serialized against other callers."""
         async with self._lock:
-            if not self._client.connected:
-                try:
-                    await self._client.connect()
-                except (ModbusError, OSError) as err:
-                    if not await self._try_rediscover():
-                        raise UpdateFailed(str(err)) from err
+            if not self._client.connected and not await self._ensure_connected():
+                raise UpdateFailed(f"Gateway {self._host} is unreachable")
             try:
                 return await self._read_all(blocks)
             except (ModbusError, OSError) as err:
                 await self._client.close()
-                # Cheap path first: a transient blip usually just needs a fresh
-                # socket to the same host. Only sweep the subnet if that fails
-                # (i.e. the gateway's IP actually changed).
-                try:
-                    await self._client.connect()
-                    return await self._read_all(blocks)
-                except (ModbusError, OSError):
-                    await self._client.close()
-                if await self._try_rediscover():
+                if await self._ensure_connected():
                     try:
                         return await self._read_all(blocks)
                     except (ModbusError, OSError) as err2:
                         raise UpdateFailed(str(err2)) from err2
                 raise UpdateFailed(str(err)) from err
+
+    async def _ensure_connected(self) -> bool:
+        """Get a working connection, recovering from a dropped gateway.
+
+        Cheap path runs every call: just (re)connect to the known host — a
+        static/reserved IP returns at the same address, so this recovers the
+        instant the gateway is back. The expensive subnet rescan (for the rare
+        case the IP actually changed) is rate-limited with a growing backoff so
+        a sustained outage doesn't sweep all 254 hosts every couple of seconds.
+        """
+        # 1. Cheap: try the host we already know.
+        try:
+            await self._client.connect()
+            if self._down:
+                _LOGGER.warning("Reconnected to gateway at %s", self._host)
+            self._down = False
+            self._scan_backoff = float(SCAN_BACKOFF_MIN)
+            return True
+        except (ModbusError, OSError):
+            await self._client.close()
+
+        # 2. Same host failed — log the loss once, then rescan on a backoff.
+        if not self._down:
+            _LOGGER.warning("Lost connection to gateway at %s", self._host)
+            self._down = True
+
+        now = self.hass.loop.time()
+        if now - self._last_scan < self._scan_backoff:
+            return False  # within the backoff window; keep cheaply retrying
+        self._last_scan = now
+
+        if await self._try_rediscover():
+            self._down = False
+            self._scan_backoff = float(SCAN_BACKOFF_MIN)
+            return True
+
+        self._scan_backoff = min(self._scan_backoff * 2, float(SCAN_BACKOFF_MAX))
+        return False
 
     async def _read_all(
         self, blocks: list[_Block]
@@ -198,18 +231,24 @@ class SchneiderConnection:
                 continue
 
     async def _try_rediscover(self) -> bool:
-        """Scan the subnet for the gateway and switch to its current IP."""
+        """Scan the subnet for the gateway and switch to its current IP.
+
+        Only called on a backoff schedule (see ``_ensure_connected``), for the
+        rare case the gateway's IP changed rather than it just being offline.
+        """
         if self._rediscovering:
             return False
         self._rediscovering = True
         try:
-            _LOGGER.warning(
-                "Lost connection to gateway at %s; scanning subnet to relocate it",
-                self._host,
+            _LOGGER.info(
+                "Scanning subnet for the gateway (was %s)", self._host
             )
             found = await scan_for_gateways(self.hass, self._port, self._cidr)
             if not found:
-                _LOGGER.warning("Rediscovery scan found no Conext gateway")
+                _LOGGER.debug(
+                    "Rescan found no gateway; next rescan in up to %ds",
+                    int(self._scan_backoff),
+                )
                 return False
 
             new_host = found[0]
@@ -224,7 +263,7 @@ class SchneiderConnection:
                 )
             return True
         except (ModbusError, OSError) as err:
-            _LOGGER.error("Rediscovery failed: %s", err)
+            _LOGGER.debug("Rescan/reconnect failed: %s", err)
             return False
         finally:
             self._rediscovering = False
