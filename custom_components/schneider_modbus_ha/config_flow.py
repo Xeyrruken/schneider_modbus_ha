@@ -39,13 +39,14 @@ from .const import (
     DEFAULT_WORD_ORDER,
     DOMAIN,
     SIGNATURE_ADDRESS,
-    SIGNATURE_INPUT_TYPE,
     SIGNATURE_SLAVE,
     WORD_ORDER_OPTIONS,
 )
+from homeassistant.components.modbus import async_get_temporary_unit
+from modbus_connection import ModbusError, ModbusTcpParams
+
 from .devices import DEVICE_TYPES, DEVICE_TYPES_BY_KEY, LEGACY_DEVICES, build_sensors
 from .discovery import detect_devices, scan_for_gateways
-from .modbus_api import ModbusError, SchneiderModbus
 
 # Friendly labels for the manual "add a device" type dropdown.
 _TYPE_LABELS = {d.key: d.name for d in DEVICE_TYPES}
@@ -64,18 +65,15 @@ async def _resolve_uid(hass, host: str) -> str:
     return uuid.uuid4().hex
 
 
-async def _validate_host(host: str, port: int) -> bool:
-    client = SchneiderModbus(host, port)
+async def _validate_host(hass, host: str, port: int) -> bool:
+    """Confirm the Conext gateway answers at host:port via HA's shared modbus."""
+    params = ModbusTcpParams(host=host, port=port)
     try:
-        await client.connect()
-        await client.read_registers(
-            SIGNATURE_SLAVE, SIGNATURE_INPUT_TYPE, SIGNATURE_ADDRESS, 1
-        )
+        async with async_get_temporary_unit(hass, params, SIGNATURE_SLAVE) as unit:
+            await unit.read_input_registers(SIGNATURE_ADDRESS, 1)
         return True
     except (ModbusError, OSError):
         return False
-    finally:
-        await client.close()
 
 
 def _candidate_label(cand: dict) -> str:
@@ -130,7 +128,7 @@ class SchneiderConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             host = user_input[CONF_HOST]
             port = user_input[CONF_PORT]
-            if await _validate_host(host, port):
+            if await _validate_host(self.hass, host, port):
                 return await self._set_host(host, port)
             errors["base"] = "cannot_connect"
 
@@ -152,7 +150,7 @@ class SchneiderConfigFlow(ConfigFlow, domain=DOMAIN):
         self._uid = await _resolve_uid(self.hass, host)
         await self.async_set_unique_id(self._uid)
         self._abort_if_unique_id_configured(updates={CONF_HOST: host})
-        self._candidates = await detect_devices(host, port)
+        self._candidates = await detect_devices(self.hass, host, port)
         return await self.async_step_select()
 
     async def async_step_select(
@@ -237,7 +235,7 @@ class SchneiderConfigFlow(ConfigFlow, domain=DOMAIN):
         self._reconfigure_entry = entry
         self._host = entry.data[CONF_HOST]
         self._port = entry.data[CONF_PORT]
-        self._candidates = await detect_devices(self._host, self._port)
+        self._candidates = await detect_devices(self.hass, self._host, self._port)
         return await self.async_step_select()
 
     @staticmethod

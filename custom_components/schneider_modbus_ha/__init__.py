@@ -47,7 +47,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     live_interval: int = entry.options.get(CONF_LIVE_INTERVAL, DEFAULT_LIVE_INTERVAL)
     main_interval: int = entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
 
-    # One shared Modbus connection; reads are serialized via its internal lock.
+    # Holds one shared Modbus unit per slave from HA's modbus integration.
     connection = SchneiderConnection(hass, entry)
 
     coordinators: list[SchneiderCoordinator] = []
