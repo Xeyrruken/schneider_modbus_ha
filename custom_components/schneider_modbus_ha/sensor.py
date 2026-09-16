@@ -32,11 +32,14 @@ async def async_setup_entry(
     entry_data: dict = hass.data[DOMAIN][entry.entry_id]
     device_uid: str = entry.data[CONF_DEVICE_UID]
     coordinators: list[SchneiderCoordinator] = entry_data["coordinators"]
+    gateway_device_id: str | None = entry_data.get("gateway_device_id")
 
     entities: list[SchneiderSensor] = []
     for coordinator in coordinators:
         for reg in coordinator.sensors:
-            entities.append(SchneiderSensor(coordinator, reg, device_uid))
+            entities.append(
+                SchneiderSensor(coordinator, reg, device_uid, gateway_device_id)
+            )
 
     async_add_entities(entities)
 
@@ -51,6 +54,7 @@ class SchneiderSensor(CoordinatorEntity[SchneiderCoordinator], SensorEntity):
         coordinator: SchneiderCoordinator,
         reg: RegSensor,
         device_uid: str,
+        gateway_device_id: str | None,
     ) -> None:
         # Pass the register as the coordinator context so the coordinator only
         # polls registers whose entity is actually enabled/added.
@@ -81,8 +85,10 @@ class SchneiderSensor(CoordinatorEntity[SchneiderCoordinator], SensorEntity):
         )
         if reg.device_serial:
             device_info["serial_number"] = reg.device_serial
-        if reg.device_instance != GATEWAY_INSTANCE:
-            device_info["via_device"] = (DOMAIN, f"{device_uid}_{GATEWAY_INSTANCE}")
+        # HA 2026.9: link sub-devices to the gateway by registry id
+        # (`via_device` identifier tuples are no longer accepted).
+        if reg.device_instance != GATEWAY_INSTANCE and gateway_device_id:
+            device_info["via_device_id"] = gateway_device_id
         self._attr_device_info = device_info
 
     async def async_added_to_hass(self) -> None:

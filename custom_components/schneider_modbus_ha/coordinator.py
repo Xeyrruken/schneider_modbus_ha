@@ -129,6 +129,9 @@ class SchneiderConnection:
         # Block identities (slave, itype, start, end) known to need the run-by-run
         # fallback, so we skip the doomed optimistic whole-block read next time.
         self._needs_runs: set[tuple[int, str, int, int]] = set()
+        # Slaves we've already logged a device rejection for (log once, re-arm
+        # on the next successful read of that slave).
+        self._logged_exc: set[int] = set()
 
     def _unit(self, slave: int) -> ModbusUnit:
         unit = self._units.get(slave)
@@ -176,16 +179,13 @@ class SchneiderConnection:
         if key not in self._needs_runs and len(block.runs) == 1:
             try:
                 words = await reader(block.start, block.count)
+                self._logged_exc.discard(block.slave)
                 for i, word in enumerate(words):
                     reg_map[block.start + i] = word
                 return
-            except ModbusExceptionError:
+            except ModbusExceptionError as exc:
                 self._needs_runs.add(key)
-                _LOGGER.info(
-                    "Gateway rejected block (slave %d, %s %d+%d); reading by "
-                    "contiguous runs instead",
-                    block.slave, block.input_type, block.start, block.count,
-                )
+                self._note_device_exception(block, exc)
             # A transport error propagates for the poll to fail cleanly.
         elif key not in self._needs_runs and len(block.runs) > 1:
             self._needs_runs.add(key)  # has gaps; skip straight to runs
@@ -195,10 +195,34 @@ class SchneiderConnection:
         for start, count in block.runs:
             try:
                 words = await reader(start, count)
+                self._logged_exc.discard(block.slave)
                 for i, word in enumerate(words):
                     reg_map[start + i] = word
-            except ModbusExceptionError:
+            except ModbusExceptionError as exc:
+                self._note_device_exception(block, exc)
                 continue
+
+    def _note_device_exception(
+        self, block: _Block, exc: ModbusExceptionError
+    ) -> None:
+        """Log, once per slave, that the gateway rejected reads for a device.
+
+        Turns a silently-skipped read into a plain reason a user can see in
+        Settings → System → Logs, with the exact Modbus exception code.
+        """
+        if block.slave in self._logged_exc:
+            return
+        self._logged_exc.add(block.slave)
+        code = getattr(exc, "exception_code", None)
+        _LOGGER.warning(
+            "Slave %d: the gateway answered but REJECTED the read with Modbus "
+            "exception %s. Codes 10/11 (gateway path unavailable / target "
+            "failed to respond) mean the gateway cannot reach this device on "
+            "the Conext Xanbus bus — check it is powered and on the bus, and "
+            "power-cycle the gateway to re-enumerate. Code 2 (illegal data "
+            "address) means the register is not served by this device.",
+            block.slave, code,
+        )
 
 
 class SchneiderCoordinator(DataUpdateCoordinator[dict[str, object]]):
