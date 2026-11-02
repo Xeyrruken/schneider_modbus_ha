@@ -1,37 +1,45 @@
 """Polling for the Schneider Conext gateway.
 
-A single :class:`SchneiderConnection` owns the one Modbus socket (reads are
-serialized with a lock), the IP auto-rediscovery, and the adaptive block reads.
-Two :class:`SchneiderCoordinator` instances share that connection: a small
-"live" group polled fast and the main group polled slowly.
+Since HA 2026.9 the Modbus socket is owned and shared by Home Assistant's
+``modbus`` integration: we ask it for one :class:`ModbusUnit` per slave over a
+single pooled connection (``async_get_unit``). The connection auto-connects on
+the first read, serializes concurrent reads, reconnects on the next read after
+a drop, and never retries a request — so this module holds no socket, no lock,
+and no reconnection logic of its own.
+
+:class:`SchneiderConnection` groups sensor registers into block reads (with a
+gap-free contiguous-run fallback for the Conext gateway, which rejects reads
+that span an unmapped hole or cut a 32-bit register pair). Two
+:class:`SchneiderCoordinator` instances share it: a small "live" group polled
+fast and the main group polled slowly.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import timedelta
+from typing import TYPE_CHECKING
 
+from homeassistant.components.modbus import async_get_unit
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from modbus_connection import ModbusError, ModbusExceptionError, ModbusTcpParams
 
 from .const import (
     CONF_HOST,
     CONF_PORT,
-    CONF_SCAN_CIDR,
     CONF_WORD_ORDER,
     DEFAULT_PORT,
     DEFAULT_WORD_ORDER,
-    DOMAIN,
     MAX_BLOCK_GAP,
     MAX_BLOCK_REGISTERS,
-    SCAN_BACKOFF_MAX,
-    SCAN_BACKOFF_MIN,
 )
+from .decode import decode
 from .devices import RegSensor
-from .discovery import scan_for_gateways
-from .modbus_api import ModbusDeviceException, ModbusError, SchneiderModbus, decode
+
+if TYPE_CHECKING:
+    from modbus_connection import ModbusUnit
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -39,11 +47,10 @@ _LOGGER = logging.getLogger(__name__)
 class _Block:
     """A planned read for one (slave, input_type).
 
-    ``whole`` is the optimistic single read spanning ``start``..``end`` (small
-    gaps bridged). ``runs`` are the fallback reads: each is a *contiguous run of
-    real sensor registers* — whole values back-to-back with no gap. Reading by
-    runs never bridges an unmapped hole and never cuts a 32-bit register pair,
-    both of which the Conext gateway rejects.
+    ``runs`` are the fallback reads: each is a *contiguous run of real sensor
+    registers* — whole values back-to-back with no gap. Reading by runs never
+    bridges an unmapped hole and never cuts a 32-bit register pair, both of
+    which the Conext gateway rejects.
     """
 
     __slots__ = ("slave", "input_type", "start", "end", "runs")
@@ -80,7 +87,7 @@ def _plan_blocks(sensors: list[RegSensor]) -> list[_Block]:
     blocks: list[_Block] = []
     for (slave, input_type), regs in groups.items():
         regs.sort(key=lambda r: r.address)
-        cur_start = cur_end = regs[0].address + 0
+        cur_start = regs[0].address
         cur_end = regs[0].address + regs[0].count
         run_start = regs[0].address
         runs: list[tuple[int, int]] = []
@@ -104,117 +111,82 @@ def _plan_blocks(sensors: list[RegSensor]) -> list[_Block]:
 
 
 class SchneiderConnection:
-    """Owns the single Modbus client, a read lock, and IP rediscovery."""
+    """Holds one shared Modbus unit per slave and does the block reads.
+
+    The units come from HA's ``modbus`` integration, which owns the socket and
+    shares it across every consumer of the same endpoint.
+    """
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         self.hass = hass
         self.entry = entry
-        self._host = entry.data[CONF_HOST]
-        self._port = entry.data.get(CONF_PORT, DEFAULT_PORT)
         self.word_order = entry.options.get(CONF_WORD_ORDER, DEFAULT_WORD_ORDER)
-        self._cidr = entry.options.get(CONF_SCAN_CIDR) or None
-        self._client = SchneiderModbus(self._host, self._port)
-        self._lock = asyncio.Lock()
-        self._rediscovering = False
+        self._params = ModbusTcpParams(
+            host=entry.data[CONF_HOST],
+            port=entry.data.get(CONF_PORT, DEFAULT_PORT),
+        )
+        self._units: dict[int, ModbusUnit] = {}
         # Block identities (slave, itype, start, end) known to need the run-by-run
         # fallback, so we skip the doomed optimistic whole-block read next time.
         self._needs_runs: set[tuple[int, str, int, int]] = set()
-        # Reconnection state. ``_down`` gates one-shot loss/restore logging;
-        # ``_last_scan`` + ``_scan_backoff`` rate-limit the subnet rescan.
-        self._down = False
-        self._last_scan = 0.0
-        self._scan_backoff = float(SCAN_BACKOFF_MIN)
+        # Slaves we've already logged a device rejection for (log once, re-arm
+        # on the next successful read of that slave).
+        self._logged_exc: set[int] = set()
+
+    def _unit(self, slave: int) -> ModbusUnit:
+        unit = self._units.get(slave)
+        if unit is None:
+            # Asking for a unit performs no I/O; the shared connection connects
+            # on the first read and is released when the entry unloads.
+            unit = self._units[slave] = async_get_unit(
+                self.hass, self.entry, self._params, slave
+            )
+        return unit
 
     async def close(self) -> None:
-        await self._client.close()
+        # HA releases the shared units/connection when the entry unloads; we
+        # only drop our references.
+        self._units.clear()
 
     async def read_blocks(
         self, blocks: list[_Block]
     ) -> dict[tuple[int, str], dict[int, int]]:
-        """Read the given blocks, serialized against other callers."""
-        async with self._lock:
-            if not self._client.connected and not await self._ensure_connected():
-                raise UpdateFailed(f"Gateway {self._host} is unreachable")
-            try:
-                return await self._read_all(blocks)
-            except (ModbusError, OSError) as err:
-                await self._client.close()
-                if await self._ensure_connected():
-                    try:
-                        return await self._read_all(blocks)
-                    except (ModbusError, OSError) as err2:
-                        raise UpdateFailed(str(err2)) from err2
-                raise UpdateFailed(str(err)) from err
-
-    async def _ensure_connected(self) -> bool:
-        """Get a working connection, recovering from a dropped gateway.
-
-        Cheap path runs every call: just (re)connect to the known host — a
-        static/reserved IP returns at the same address, so this recovers the
-        instant the gateway is back. The expensive subnet rescan (for the rare
-        case the IP actually changed) is rate-limited with a growing backoff so
-        a sustained outage doesn't sweep all 254 hosts every couple of seconds.
-        """
-        # 1. Cheap: try the host we already know.
-        try:
-            await self._client.connect()
-            if self._down:
-                _LOGGER.warning("Reconnected to gateway at %s", self._host)
-            self._down = False
-            self._scan_backoff = float(SCAN_BACKOFF_MIN)
-            return True
-        except (ModbusError, OSError):
-            await self._client.close()
-
-        # 2. Same host failed — log the loss once, then rescan on a backoff.
-        if not self._down:
-            _LOGGER.warning("Lost connection to gateway at %s", self._host)
-            self._down = True
-
-        now = self.hass.loop.time()
-        if now - self._last_scan < self._scan_backoff:
-            return False  # within the backoff window; keep cheaply retrying
-        self._last_scan = now
-
-        if await self._try_rediscover():
-            self._down = False
-            self._scan_backoff = float(SCAN_BACKOFF_MIN)
-            return True
-
-        self._scan_backoff = min(self._scan_backoff * 2, float(SCAN_BACKOFF_MAX))
-        return False
-
-    async def _read_all(
-        self, blocks: list[_Block]
-    ) -> dict[tuple[int, str], dict[int, int]]:
+        """Read the given blocks. A transport failure aborts the whole poll."""
         cache: dict[tuple[int, str], dict[int, int]] = {}
-        for block in blocks:
-            reg_map = cache.setdefault((block.slave, block.input_type), {})
-            await self._read_block(block, reg_map)
+        try:
+            for block in blocks:
+                reg_map = cache.setdefault((block.slave, block.input_type), {})
+                await self._read_block(block, reg_map)
+        except ModbusError as err:
+            # Device (illegal-address) exceptions are handled per-block below;
+            # anything that reaches here is a transport/connection failure. Let
+            # the coordinator mark the group unavailable — HA reconnects the
+            # shared link on the next poll's first read (no retry from us).
+            raise UpdateFailed(str(err)) from err
         return cache
 
     async def _read_block(self, block: _Block, reg_map: dict[int, int]) -> None:
+        unit = self._unit(block.slave)
+        reader = (
+            unit.read_input_registers
+            if block.input_type == "input"
+            else unit.read_holding_registers
+        )
         key = (block.slave, block.input_type, block.start, block.end)
 
-        # Optimistic single read of the whole bridged span — but only if it
-        # isn't already known to need the fallback, and only worth trying when
-        # the span is a single gap-free run.
+        # Optimistic single read of the whole bridged span, but only when it is
+        # a single gap-free run and not already known to need the fallback.
         if key not in self._needs_runs and len(block.runs) == 1:
             try:
-                words = await self._client.read_registers(
-                    block.slave, block.input_type, block.start, block.count
-                )
+                words = await reader(block.start, block.count)
+                self._logged_exc.discard(block.slave)
                 for i, word in enumerate(words):
                     reg_map[block.start + i] = word
                 return
-            except ModbusDeviceException:
+            except ModbusExceptionError as exc:
                 self._needs_runs.add(key)
-                _LOGGER.info(
-                    "Gateway rejected block (slave %d, %s %d+%d); reading by "
-                    "contiguous runs instead",
-                    block.slave, block.input_type, block.start, block.count,
-                )
-            # ModbusError (transport) propagates for rediscovery handling.
+                self._note_device_exception(block, exc)
+            # A transport error propagates for the poll to fail cleanly.
         elif key not in self._needs_runs and len(block.runs) > 1:
             self._needs_runs.add(key)  # has gaps; skip straight to runs
 
@@ -222,51 +194,35 @@ class SchneiderConnection:
         # device genuinely rejects it (register absent on this hardware).
         for start, count in block.runs:
             try:
-                words = await self._client.read_registers(
-                    block.slave, block.input_type, start, count
-                )
+                words = await reader(start, count)
+                self._logged_exc.discard(block.slave)
                 for i, word in enumerate(words):
                     reg_map[start + i] = word
-            except ModbusDeviceException:
+            except ModbusExceptionError as exc:
+                self._note_device_exception(block, exc)
                 continue
 
-    async def _try_rediscover(self) -> bool:
-        """Scan the subnet for the gateway and switch to its current IP.
+    def _note_device_exception(
+        self, block: _Block, exc: ModbusExceptionError
+    ) -> None:
+        """Log, once per slave, that the gateway rejected reads for a device.
 
-        Only called on a backoff schedule (see ``_ensure_connected``), for the
-        rare case the gateway's IP changed rather than it just being offline.
+        Turns a silently-skipped read into a plain reason a user can see in
+        Settings → System → Logs, with the exact Modbus exception code.
         """
-        if self._rediscovering:
-            return False
-        self._rediscovering = True
-        try:
-            _LOGGER.info(
-                "Scanning subnet for the gateway (was %s)", self._host
-            )
-            found = await scan_for_gateways(self.hass, self._port, self._cidr)
-            if not found:
-                _LOGGER.debug(
-                    "Rescan found no gateway; next rescan in up to %ds",
-                    int(self._scan_backoff),
-                )
-                return False
-
-            new_host = found[0]
-            self._host = new_host
-            self._client.host = new_host
-            await self._client.connect()
-            _LOGGER.warning("Gateway relocated to %s; reconnected", new_host)
-
-            if new_host != self.entry.data.get(CONF_HOST):
-                self.hass.config_entries.async_update_entry(
-                    self.entry, data={**self.entry.data, CONF_HOST: new_host}
-                )
-            return True
-        except (ModbusError, OSError) as err:
-            _LOGGER.debug("Rescan/reconnect failed: %s", err)
-            return False
-        finally:
-            self._rediscovering = False
+        if block.slave in self._logged_exc:
+            return
+        self._logged_exc.add(block.slave)
+        code = getattr(exc, "exception_code", None)
+        _LOGGER.warning(
+            "Slave %d: the gateway answered but REJECTED the read with Modbus "
+            "exception %s. Codes 10/11 (gateway path unavailable / target "
+            "failed to respond) mean the gateway cannot reach this device on "
+            "the Conext Xanbus bus — check it is powered and on the bus, and "
+            "power-cycle the gateway to re-enumerate. Code 2 (illegal data "
+            "address) means the register is not served by this device.",
+            block.slave, code,
+        )
 
 
 class SchneiderCoordinator(DataUpdateCoordinator[dict[str, object]]):

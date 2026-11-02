@@ -1,4 +1,10 @@
-"""Subnet scanning + Modbus identity confirmation for the Conext gateway."""
+"""Subnet scanning + Modbus identity confirmation for the Conext gateway.
+
+Modbus reads go through HA's shared ``modbus`` connection via
+``async_get_temporary_unit`` (a no-entry context manager meant for config
+flows). The TCP port sweep stays a plain socket probe so we don't spin up a
+Modbus connection for every dead host on the subnet.
+"""
 
 from __future__ import annotations
 
@@ -7,20 +13,22 @@ import ipaddress
 import logging
 
 from homeassistant.components import network
+from homeassistant.components.modbus import async_get_temporary_unit
 from homeassistant.core import HomeAssistant
+from modbus_connection import ModbusError, ModbusTcpParams
 
 from .const import (
-    DEFAULT_TIMEOUT,
-    PROBE_TIMEOUT,
     SCAN_CONCURRENCY,
     SCAN_CONNECT_TIMEOUT,
     SCAN_LOOKAHEAD,
     SIGNATURE_ADDRESS,
-    SIGNATURE_INPUT_TYPE,
     SIGNATURE_SLAVE,
 )
+from .decode import decode_string
 from .devices import DEVICE_TYPES, DeviceType, StrSpec
-from .modbus_api import ModbusError, SchneiderModbus, decode_string
+
+if False:  # typing only, avoids importing at runtime
+    from modbus_connection import ModbusUnit
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -69,19 +77,15 @@ async def _port_open(host: str, port: int) -> bool:
         return False
 
 
-async def _is_gateway(host: str, port: int) -> bool:
+async def _is_gateway(hass: HomeAssistant, host: str, port: int) -> bool:
     """Confirm a host is the Conext gateway via the signature register read."""
-    client = SchneiderModbus(host, port, timeout=DEFAULT_TIMEOUT)
+    params = ModbusTcpParams(host=host, port=port)
     try:
-        await client.connect()
-        await client.read_registers(
-            SIGNATURE_SLAVE, SIGNATURE_INPUT_TYPE, SIGNATURE_ADDRESS, 1
-        )
+        async with async_get_temporary_unit(hass, params, SIGNATURE_SLAVE) as unit:
+            await unit.read_input_registers(SIGNATURE_ADDRESS, 1)
         return True
     except (ModbusError, OSError, asyncio.TimeoutError):
         return False
-    finally:
-        await client.close()
 
 
 async def scan_for_gateways(
@@ -112,25 +116,26 @@ async def scan_for_gateways(
 
     found: list[str] = []
     for host in open_hosts:
-        if await _is_gateway(host, port):
+        if await _is_gateway(hass, host, port):
             found.append(host)
     return found
 
 
-async def _read_string(
-    client: SchneiderModbus, slave: int, spec: StrSpec
-) -> str:
+async def _read_string(unit: "ModbusUnit", spec: StrSpec) -> str:
     """Best-effort read of a common-block string (name/serial)."""
     try:
-        words = await client.read_registers(
-            slave, spec.input_type, spec.address, spec.length
-        )
+        if spec.input_type == "input":
+            words = await unit.read_input_registers(spec.address, spec.length)
+        else:
+            words = await unit.read_holding_registers(spec.address, spec.length)
         return decode_string(words)
     except (ModbusError, OSError, asyncio.TimeoutError):
         return ""
 
 
-async def _scan_range(client: SchneiderModbus, dtype: DeviceType) -> list[dict]:
+async def _scan_range(
+    hass: HomeAssistant, params: ModbusTcpParams, dtype: DeviceType
+) -> list[dict]:
     """Scan one device-type's slave range; stop after a run of empty ids.
 
     The gateway pre-allocates each type's id range and answers reads for unused
@@ -141,9 +146,10 @@ async def _scan_range(client: SchneiderModbus, dtype: DeviceType) -> list[dict]:
     found: list[dict] = []
     absent = 0
     for slave in range(dtype.range_start, dtype.range_end + 1):
-        name = await _read_string(client, slave, dtype.name_spec)
+        async with async_get_temporary_unit(hass, params, slave) as unit:
+            name = await _read_string(unit, dtype.name_spec)
+            serial = await _read_string(unit, dtype.serial_spec) if name else ""
         if name:
-            serial = await _read_string(client, slave, dtype.serial_spec)
             _LOGGER.debug("Found %s at slave %d: name=%r serial=%r",
                           dtype.key, slave, name, serial)
             found.append(
@@ -157,17 +163,16 @@ async def _scan_range(client: SchneiderModbus, dtype: DeviceType) -> list[dict]:
     return found
 
 
-async def detect_devices(host: str, port: int) -> list[dict]:
+async def detect_devices(hass: HomeAssistant, host: str, port: int) -> list[dict]:
     """Probe the Conext slave-id ranges and return the devices found.
 
     Returns a list of ``{"type", "slave", "name", "serial"}``.
     """
-    client = SchneiderModbus(host, port, timeout=PROBE_TIMEOUT)
+    params = ModbusTcpParams(host=host, port=port)
     detected: list[dict] = []
-    try:
-        await client.connect()
+    # Hold one unit open for the whole scan so the shared connection stays up
+    # across every per-slave probe instead of reconnecting each time.
+    async with async_get_temporary_unit(hass, params, SIGNATURE_SLAVE):
         for dtype in DEVICE_TYPES:
-            detected.extend(await _scan_range(client, dtype))
-    finally:
-        await client.close()
+            detected.extend(await _scan_range(hass, params, dtype))
     return detected
