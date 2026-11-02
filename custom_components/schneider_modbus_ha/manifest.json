@@ -9,5 +9,5 @@
   "iot_class": "local_polling",
   "issue_tracker": "https://github.com/Xeyrruken/schneider_modbus_ha/issues",
   "requirements": ["getmac>=0.9.0"],
-  "version": "0.0.3-alpha"
+  "version": "0.0.4-alpha"
 }
