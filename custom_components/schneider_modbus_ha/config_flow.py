@@ -325,10 +325,6 @@ class SchneiderOptionsFlow(OptionsFlow):
                         CONF_WORD_ORDER,
                         default=opts.get(CONF_WORD_ORDER, DEFAULT_WORD_ORDER),
                     ): vol.In(WORD_ORDER_OPTIONS),
-                    vol.Optional(
-                        CONF_SCAN_CIDR,
-                        default=opts.get(CONF_SCAN_CIDR, ""),
-                    ): str,
                 }
             ),
         )
