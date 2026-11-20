@@ -48,9 +48,28 @@ Replaces a hand-maintained `modbus:` + `template:` YAML setup.
 
 ### HACS (recommended)
 
-1. HACS → ⋮ → **Custom repositories** → add
-   `https://github.com/Xeyrruken/schneider_modbus_ha`, type *Integration*.
-2. Install **Schneider Conext / Insight Home**, then restart Home Assistant.
+This integration isn't in the HACS default store, so add it as a **custom
+repository** first. You only need to do this once.
+
+1. Make sure [HACS](https://hacs.xyz/docs/use/) is installed.
+2. In Home Assistant, open **HACS** from the sidebar.
+3. Click the **⋮** menu (top right) → **Custom repositories**.
+4. Fill in:
+   - **Repository:** `https://github.com/Xeyrruken/schneider_modbus_ha`
+   - **Type:** *Integration*
+
+   Then click **Add** and close the dialog.
+5. Search HACS for **Schneider Conext / Insight Home** and open it.
+6. Click **Download**. Releases are currently **alpha (pre-release)** versions,
+   which HACS hides by default, so in the download dialog turn on **Show beta
+   versions** and pick the newest version (e.g. `v0.0.4-alpha`). Then click
+   **Download**.
+7. **Restart Home Assistant** (**Settings → System → ⋮ → Restart Home
+   Assistant**).
+8. Continue with [Set up](#set-up) below.
+
+HACS will notify you about new versions like any other integration. Updating
+is **Update** in HACS followed by a restart.
 
 ### Manual
 
