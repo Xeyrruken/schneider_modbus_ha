@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Setup and install instructions
+    url: https://github.com/Xeyrruken/schneider_modbus_ha#readme
+    about: Check the README for install steps, requirements and options first.

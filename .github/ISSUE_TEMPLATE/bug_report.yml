@@ -1,0 +1,119 @@
+name: Bug report
+description: Something isn't working, or a sensor shows a wrong value.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a problem! The more detail you
+        give, the faster it can be fixed.
+
+        **Please don't post passwords, public IP addresses or serial numbers.**
+
+  - type: dropdown
+    id: problem-type
+    attributes:
+      label: What kind of problem is it?
+      options:
+        - Setup / gateway not found
+        - Device not detected
+        - Sensor shows a wrong value or scale
+        - Entities unavailable
+        - Errors in the Home Assistant log
+        - Something else
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the problem. If a sensor is wrong, name the sensor.
+      placeholder: e.g. "XW Load AC Power shows 64000 W while the inverter is idle."
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+      description: For wrong values, what does Insight Home / the Conext app show for the same reading?
+      placeholder: e.g. "About 640 W, as shown in Insight Home."
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: If it only happens sometimes, say when (e.g. after a restart, at night, during a grid outage).
+      placeholder: |
+        1. ...
+        2. ...
+
+  - type: input
+    id: integration-version
+    attributes:
+      label: Integration version
+      description: Shown in HACS, or in Settings → Devices & Services → Schneider Conext / Insight Home.
+      placeholder: e.g. v0.0.4-alpha
+    validations:
+      required: true
+
+  - type: input
+    id: ha-version
+    attributes:
+      label: Home Assistant version
+      description: Settings → About.
+      placeholder: e.g. 2026.11.1
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install-type
+    attributes:
+      label: Home Assistant installation type
+      options:
+        - Home Assistant OS
+        - Container
+        - Core
+        - Supervised
+        - Not sure
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: devices
+    attributes:
+      label: Which Conext devices do you have?
+      options:
+        - label: Gateway / Insight Home
+        - label: XW / XW+ / XW Pro inverter
+        - label: MPPT charge controller
+        - label: SCP (System Control Panel)
+        - label: Conext SW inverter
+        - label: Battery Monitor
+
+  - type: input
+    id: other-devices
+    attributes:
+      label: Device models, slave IDs and gateway firmware
+      description: Optional, but very helpful for wrong values. Slave IDs are shown when you reconfigure the integration.
+      placeholder: e.g. XW Pro 6848 (slave 10), 2× MPPT 60 150 (slaves 30, 31), gateway firmware 1.21
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Debug logs
+      description: |
+        To turn on debug logging, open Settings → Devices & Services →
+        Schneider Conext / Insight Home → ⋮ → **Enable debug logging**,
+        reproduce the problem, then turn it off again. A log file downloads
+        automatically. Paste the relevant lines here, or drag the file in.
+      render: text
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: Screenshots, Modbus map notes, or anything else that might help.
