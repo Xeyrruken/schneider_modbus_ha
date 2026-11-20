@@ -1,80 +1,94 @@
 # Schneider Conext / Insight Home — Home Assistant integration
 
 A custom integration that reads a Schneider Electric Conext gateway (Insight Home)
-over Modbus TCP, with **automatic discovery of the gateway's IP** and
-**transparent recovery when that IP changes**.
+over Modbus TCP and turns your inverter, charge controllers and other Conext
+devices into native, UI-configured Home Assistant entities.
 
-Replaces a hand-maintained `modbus:` + `template:` YAML setup with native,
-UI-configured entities.
+Replaces a hand-maintained `modbus:` + `template:` YAML setup.
+
+> **Alpha software.** It works on the author's own system (gateway, XW+, two
+> MPPT 60s, SCP), but other setups are less tested. Please open an issue if
+> something reads wrong.
 
 ## Features
 
-- Auto-discovers the gateway by scanning the local subnet and confirming each
-  candidate with a Modbus signature read (no MAC list or mDNS needed).
+- **Finds the gateway for you**: scans the local network and confirms each
+  candidate with a Modbus signature read. You can also enter the IP manually.
 - **Auto-detects connected devices** at setup by scanning each Conext device
-  type's slave-ID range (from its base, stopping after a short gap — matches
-  Schneider's contiguous assignment). Reads each device's **name** and **serial**
-  from the common block, so a second MPPT, an SCP, etc. are found on their own.
-- **You choose what to create**: setup shows every detected device (name + slave
-  + type) to select from, lets you give a custom name, and lets you **add a
-  device** that wasn't found. Entities are built only for your selection.
-  Re-scan/re-select any time via the integration's **Reconfigure** option.
-- If the connection drops (e.g. DHCP hands the gateway a new address), the
-  integration rescans, relocates the gateway, and updates the host
-  automatically — entities keep stable IDs and history.
-- Polls efficiently: contiguous registers are batched into block reads, and a
-  block the gateway rejects (unmapped register hole) self-heals by falling back
-  to per-register reads.
+  type's slave-ID range. Reads each device's **name** and **serial**, so a
+  second MPPT, an SCP, etc. are found on their own.
+- **You choose what to create**: setup lists every detected device (name, slave
+  ID and type) to select from, lets you give a custom name, and lets you **add a
+  device** that wasn't found. Entities are created only for your selection.
+  Re-scan or re-select any time via the integration's **Reconfigure** option.
+- **Two polling speeds**: a small group of "live" sensors (e.g. power) refreshes
+  every couple of seconds, everything else on a slower interval. Only enabled
+  entities are polled.
+- **Efficient reads**: neighbouring registers are batched into block reads, with
+  an automatic fallback when the gateway rejects a block.
 - Native enum sensors for inverter status, charger mode, device state, fault /
-  warning flags — replacing the old template-sensor YAML.
-- One HA device per detected unit (Conext Gateway, XW Inverter, MPPT 60 #1/#2,
-  …), with the sub-devices linked under the gateway.
+  warning flags.
+- One HA device per unit (Conext Gateway, XW Inverter, MPPT 60 #1/#2, …), linked
+  under the gateway.
+- Supported device types: **Gateway, XW, MPPT, SCP, Conext SW, Battery
+  Monitor**, each with a curated set of the useful sensors from its Modbus map.
 
 ## Requirements
 
-- Home Assistant 2024.12 or newer (HA OS / Supervised / Container / Core).
-- A Conext gateway reachable over Modbus TCP (default port **503**).
+- **Home Assistant 2026.9.0 or newer.** The integration uses Home Assistant's
+  built-in shared Modbus connection, added in 2026.9. Older versions can use
+  release v0.0.3-alpha.
+- A Conext gateway (Insight Home / Conext Gateway) with **Modbus TCP enabled**,
+  reachable from Home Assistant (default port **503**).
+- A fixed IP for the gateway (a DHCP reservation in your router) is
+  recommended. If its address changes, use **Reconfigure** to point the
+  integration at the new one.
 
-## Install (HACS)
+## Install
 
-1. HACS → Integrations → ⋮ → **Custom repositories** → add this repo, category
-   *Integration*.
+### HACS (recommended)
+
+1. HACS → ⋮ → **Custom repositories** → add
+   `https://github.com/Xeyrruken/schneider_modbus_ha`, type *Integration*.
 2. Install **Schneider Conext / Insight Home**, then restart Home Assistant.
 
-Or copy `custom_components/schneider_modbus_ha/` into your HA `config/custom_components/`
-and restart.
+### Manual
+
+Download `schneider_modbus_ha.zip` from the
+[latest release](https://github.com/Xeyrruken/schneider_modbus_ha/releases),
+unzip it into `config/custom_components/`, and restart Home Assistant.
 
 ## Set up
 
 **Settings → Devices & Services → Add Integration → Schneider Conext / Insight Home.**
 
-- **Scan my network** — probes local subnets for a gateway. Optionally narrow
-  it with a CIDR like `192.168.50.0/24`.
-- **Enter the IP manually** — if you already know the address.
+- **Scan my network**: probes local subnets for a gateway. Optionally narrow
+  it with a CIDR like `192.168.1.0/24`.
+- **Enter the IP manually**: if you already know the address.
+
+Then pick the devices you want from the list that's found.
 
 ## Options (gear icon)
 
 | Option | Notes |
 | --- | --- |
-| Polling interval | Seconds between reads (default 30). |
-| 32-bit word order | `big` (default, matches a no-swap modbus YAML). Switch to `little` if 32-bit values (power/voltage) read wrong. |
-| Rediscovery subnet | Optional CIDR to limit the rescan when relocating the gateway. |
-
-## How rediscovery works
-
-The integration stores a device id (the gateway MAC when resolvable) so entity
-IDs never depend on the IP. On a connection failure it:
-
-1. probes the configured subnet for hosts with the Modbus port open, then
-2. reads gateway slave 1 / input register 65 to confirm identity, and
-3. reconnects to the matching host, updating the stored address.
+| Main polling interval | Seconds between reads of most sensors (default 30). |
+| Live polling interval | Seconds between reads of the live sensor group (default 2). Don't go lower than needed; polling too fast can overload the gateway. |
+| Live sensors | Which sensors belong to the live group. |
+| 32-bit word order | `big` (default). Switch to `little` only if power or voltage values look wrong. |
 
 ## Notes
 
-- Modbus addresses, scales and offsets are ported directly from the original
-  working YAML (port 503; slaves 1 = gateway, 10 = XW, 30/31 = MPPT).
-- Register definitions live as per-device-type *templates* in `registers.py`;
-  `devices.py` maps Conext slave-ID ranges to those templates and resolves them
-  against the devices detected on your system.
-- Supported device types: **Gateway, XW, MPPT, SCP, Conext SW, Battery
-  Monitor** — each with a curated set of the useful sensors from its Modbus map.
+- Register definitions live as per-device-type templates in `registers.py`;
+  `devices.py` maps Conext slave-ID ranges to those templates.
+- Found a sensor with a wrong value or scale? Please open an
+  [issue](https://github.com/Xeyrruken/schneider_modbus_ha/issues) with the
+  device type, the sensor and what you expected.
+
+## License and disclaimer
+
+[MIT](LICENSE). Provided as is, with no warranty.
+
+This is an independent community project. It is not affiliated with, endorsed
+by or supported by Schneider Electric. "Schneider Electric", "Conext" and
+"Insight" are trademarks of their respective owners.
